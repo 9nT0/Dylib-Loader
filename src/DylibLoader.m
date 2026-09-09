@@ -227,9 +227,9 @@ static BOOL LoadOne(NSString *path) {
 
     const char *cpath = path.fileSystemRepresentation;
     dlerror();
-    CFTimeInterval t0 = CACurrentMediaTime();
+    CFTimeInterval t0 = CFAbsoluteTimeGetCurrent();
     void *h = dlopen(cpath, RTLD_NOW | RTLD_GLOBAL);
-    CFTimeInterval ms = (CACurrentMediaTime() - t0) * 1000.0;
+    CFTimeInterval ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
     if (!h) {
         const char *err = dlerror();
         DLLog(@"FAIL %.1fms %s — %s", ms, cpath, err ? err : "?");
@@ -268,13 +268,13 @@ static void LoadAllCollected(void) {
         return [a[@"path"] caseInsensitiveCompare:b[@"path"]];
     }];
 
-    CFTimeInterval t0 = CACurrentMediaTime();
+    CFTimeInterval t0 = CFAbsoluteTimeGetCurrent();
     NSUInteger ok = 0;
     for (NSDictionary *item in all) {
         if (LoadOne(item[@"path"])) ok++;
     }
     DLLog(@"Loaded %lu/%lu in %.1fms", (unsigned long)ok, (unsigned long)all.count,
-          (CACurrentMediaTime() - t0) * 1000.0);
+          (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
 }
 
 #pragma mark - Notifications & schedule
