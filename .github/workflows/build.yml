@@ -23,7 +23,7 @@ jobs:
             -fobjc-arc \
             -o output/DylibLoader.dylib \
             src/DylibLoader.m \
-            -framework Foundation -framework UIKit \
+            -framework Foundation -framework UIKit -framework CoreFoundation \
             -install_name @rpath/DylibLoader.dylib
           file output/DylibLoader.dylib
           otool -l output/DylibLoader.dylib | grep -A8 LC_BUILD_VERSION || true
