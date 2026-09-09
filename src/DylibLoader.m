@@ -1,188 +1,144 @@
 /*
- * DylibLoader — high-performance LiveContainer tweak loader
- * Designed to outperform stock TweakLoader for guest-app timing.
+ * DylibLoader v1.1.0 — LiveContainer loader (crash-safe)
  *
- * Strengths vs stock TweakLoader:
- *  - Aggressive multi-root path discovery (LC Documents / app folders)
- *  - Priority queue: Substrate → critical inits → user tweaks
- *  - Tracks already-loaded paths (no double dlopen)
- *  - Explicit init symbol invocation + process-wide re-kick
- *  - Fast early re-kick burst (UI often appears 1–8s after constructor)
- *  - Scene / active observers without blocking main thread on disk I/O
- *  - Optional .framework support (loads framework binary)
+ * v1.0 froze/crashed because:
+ *  - KickAllInits + LoadAllCollected ran in a tight delayed loop
+ *  - That re-entered tweak constructors forever
+ *
+ * v1.1.0:
+ *  - Load each dylib at most once
+ *  - Init symbols called at most a few times (budget)
+ *  - No periodic full rescans after first success
+ *  - Short, capped re-kick schedule
  */
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
-#import <objc/runtime.h>
-#import <pthread.h>
 #import <os/lock.h>
-#import <dirent.h>
-#import <sys/stat.h>
-#import <stdio.h>
 #import <string.h>
 
 static NSString * const kTag = @"[DylibLoader]";
-
 static void DLLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 static void DLLog(NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+    va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSLog(@"%@ %@", kTag, m);
 }
 
-#pragma mark - State
-
 static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;
-static NSMutableSet<NSString *> *gLoadedPaths;
-static NSMutableArray<NSString *> *gLoadedOrder;
-static BOOL gBootstrapped = NO;
-static BOOL gObservers = NO;
+static NSMutableSet<NSString *> *gLoaded;
+static BOOL gStarted = NO;
+static int gKickCount = 0;
+static const int kMaxKicks = 6;           // hard cap
+static BOOL gLoadPassDone = NO;
 
 static NSMutableSet<NSString *> *LoadedSet(void) {
-    if (!gLoadedPaths) gLoadedPaths = [NSMutableSet new];
-    return gLoadedPaths;
+    if (!gLoaded) gLoaded = [NSMutableSet new];
+    return gLoaded;
 }
 
-static NSMutableArray<NSString *> *LoadedOrder(void) {
-    if (!gLoadedOrder) gLoadedOrder = [NSMutableArray new];
-    return gLoadedOrder;
-}
+#pragma mark - Init symbols (capped)
 
-#pragma mark - Init symbols (GlossyGlass + generic)
-
-static const char *kInitSymbols[] = {
+static const char *kInits[] = {
     "GlassLoaderEntry",
     "glossyglass_init",
     "TweakInitialize",
     "Initialize",
-    "DylibLoaderDidLoad",
-    "%ctor",  // not a real symbol; skipped if missing
     NULL
 };
 
 static void InvokeInits(void *handle, const char *path) {
     if (!handle) return;
-    for (const char **s = kInitSymbols; *s; ++s) {
-        if (strcmp(*s, "%ctor") == 0) continue;
+    for (const char **s = kInits; *s; s++) {
         dlerror();
         void *sym = dlsym(handle, *s);
         if (!sym) continue;
-        DLLog(@"init %s ← %s", *s, path ? path : "?");
-        @try {
-            ((void (*)(void))sym)();
-        } @catch (NSException *ex) {
-            DLLog(@"init crashed %s: %@", *s, ex);
-        }
+        DLLog(@"init %s (%s)", *s, path ? path : "?");
+        @try { ((void (*)(void))sym)(); }
+        @catch (NSException *ex) { DLLog(@"init exception: %@", ex); }
     }
 }
 
-static void KickAllInits(void) {
-    for (const char **s = kInitSymbols; *s; ++s) {
-        if (strcmp(*s, "%ctor") == 0) continue;
+static void KickAllInitsCapped(void) {
+    os_unfair_lock_lock(&gLock);
+    if (gKickCount >= kMaxKicks) {
+        os_unfair_lock_unlock(&gLock);
+        return;
+    }
+    gKickCount += 1;
+    int n = gKickCount;
+    os_unfair_lock_unlock(&gLock);
+
+    DLLog(@"kick %d/%d", n, kMaxKicks);
+    for (const char **s = kInits; *s; s++) {
         void *sym = dlsym(RTLD_DEFAULT, *s);
         if (!sym) continue;
-        @try {
-            ((void (*)(void))sym)();
-        } @catch (NSException *ex) {
-            DLLog(@"re-kick %@ crashed: %@", [NSString stringWithUTF8String:*s], ex);
-        }
+        @try { ((void (*)(void))sym)(); }
+        @catch (NSException *ex) { DLLog(@"kick exception: %@", ex); }
     }
 }
 
-#pragma mark - Path discovery (fast + broad)
+#pragma mark - Paths
 
-static void AddUnique(NSMutableArray<NSString *> *arr, NSString *path) {
-    if (!path.length) return;
-    NSString *std = path.stringByStandardizingPath;
-    if (![arr containsObject:std]) [arr addObject:std];
+static void AddUnique(NSMutableArray *arr, NSString *p) {
+    if (!p.length) return;
+    p = p.stringByStandardizingPath;
+    if (![arr containsObject:p]) [arr addObject:p];
 }
 
-static NSArray<NSString *> *DiscoverTweakRoots(void) {
+static NSArray<NSString *> *TweakRoots(void) {
     NSMutableArray *roots = [NSMutableArray array];
     NSFileManager *fm = NSFileManager.defaultManager;
 
-    // 1) Env override (highest priority)
     const char *env = getenv("DYLIBLOADER_TWEAKS");
     if (env && *env) AddUnique(roots, [NSString stringWithUTF8String:env]);
 
-    // 2) Documents/Tweaks (common LC)
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     if (docs) {
         AddUnique(roots, [docs stringByAppendingPathComponent:@"Tweaks"]);
-        // Walk Applications/*/ for per-app tweak links sometimes mirrored
         NSString *apps = [docs stringByAppendingPathComponent:@"Applications"];
-        NSArray *appDirs = [fm contentsOfDirectoryAtPath:apps error:nil];
-        for (NSString *name in appDirs) {
+        for (NSString *name in [fm contentsOfDirectoryAtPath:apps error:nil] ?: @[]) {
             NSString *cand = [[apps stringByAppendingPathComponent:name] stringByAppendingPathComponent:@"Tweaks"];
             BOOL isDir = NO;
             if ([fm fileExistsAtPath:cand isDirectory:&isDir] && isDir) AddUnique(roots, cand);
         }
     }
 
-    // 3) Library / Application Support style
     NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
     if (lib) {
         AddUnique(roots, [lib stringByAppendingPathComponent:@"Tweaks"]);
         AddUnique(roots, [lib stringByAppendingPathComponent:@"LiveContainer/Tweaks"]);
     }
 
-    // 4) Bundle-adjacent
     NSString *bundle = NSBundle.mainBundle.bundlePath;
     if (bundle.length) {
         AddUnique(roots, [bundle stringByAppendingPathComponent:@"Tweaks"]);
         AddUnique(roots, [[bundle stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"Tweaks"]);
-        AddUnique(roots, [[bundle stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"Frameworks"]);
     }
 
-    // 5) Home relative (some LC builds)
-    NSString *home = NSHomeDirectory();
-    if (home.length) {
-        AddUnique(roots, [home stringByAppendingPathComponent:@"Documents/Tweaks"]);
-        AddUnique(roots, [home stringByAppendingPathComponent:@"Library/Tweaks"]);
-    }
-
-    // Keep only existing directories
-    NSMutableArray *existing = [NSMutableArray array];
+    NSMutableArray *exist = [NSMutableArray array];
     for (NSString *r in roots) {
         BOOL isDir = NO;
-        if ([fm fileExistsAtPath:r isDirectory:&isDir] && isDir) {
-            [existing addObject:r];
-        }
+        if ([fm fileExistsAtPath:r isDirectory:&isDir] && isDir) [exist addObject:r];
     }
-    return existing;
+    return exist;
 }
 
-#pragma mark - Collect files with priority
+#pragma mark - Priority collect
 
-typedef NS_ENUM(NSInteger, DLPriority) {
-    DLPrioritySubstrate = 0,
-    DLPriorityCritical  = 1,  // DylibLoader helpers / early hooks
-    DLPriorityNormal    = 2,
-    DLPriorityLate      = 3,
-};
-
-static DLPriority PriorityForName(NSString *name) {
+static int Priority(NSString *name) {
     NSString *l = name.lowercaseString;
     if ([l containsString:@"cydiasubstrate"] || [l containsString:@"ellekit"] ||
-        [l containsString:@"libsubstrate"] || [l isEqualToString:@"substrate.dylib"]) {
-        return DLPrioritySubstrate;
-    }
-    if ([l hasPrefix:@"0_"] || [l hasPrefix:@"00"] || [l containsString:@"dylibloader"]) {
-        return DLPriorityCritical;
-    }
-    if ([l containsString:@"glossyglass"] || [l containsString:@"injector"] ||
-        [l containsString:@"hook"] || [l hasPrefix:@"1_"]) {
-        return DLPriorityNormal;
-    }
-    return DLPriorityLate;
+        [l containsString:@"libsubstrate"]) return 0;
+    if ([l hasPrefix:@"0_"] || [l hasPrefix:@"00"] || [l containsString:@"dylibloader"]) return 1;
+    if ([l containsString:@"glossyglass"]) return 2;
+    return 3;
 }
 
-static void CollectDylibs(NSString *dir, NSMutableArray<NSDictionary *> *out, int depth) {
-    if (depth > 8) return;
+static void Collect(NSString *dir, NSMutableArray *out, int depth) {
+    if (depth > 6) return;
     NSFileManager *fm = NSFileManager.defaultManager;
     NSArray *items = [[fm contentsOfDirectoryAtPath:dir error:nil]
                       sortedArrayUsingSelector:@selector(caseInsensitiveCompare:)];
@@ -192,31 +148,24 @@ static void CollectDylibs(NSString *dir, NSMutableArray<NSDictionary *> *out, in
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:full isDirectory:&isDir]) continue;
         if (isDir) {
-            // .framework: load binary inside
             if ([item.pathExtension.lowercaseString isEqualToString:@"framework"]) {
-                NSString *exec = [full stringByAppendingPathComponent:item.stringByDeletingPathExtension];
-                if ([fm fileExistsAtPath:exec]) {
-                    [out addObject:@{ @"path": exec, @"pri": @(PriorityForName(item)) }];
+                NSString *bin = [full stringByAppendingPathComponent:item.stringByDeletingPathExtension];
+                if ([fm fileExistsAtPath:bin]) {
+                    [out addObject:@{ @"path": bin, @"pri": @(Priority(item)) }];
                 }
             } else {
-                CollectDylibs(full, out, depth + 1);
+                Collect(full, out, depth + 1);
             }
             continue;
         }
-        NSString *ext = item.pathExtension.lowercaseString;
-        if (![ext isEqualToString:@"dylib"]) continue;
-        if ([item.lowercaseString containsString:@"dylibloader"] && depth == 0) {
-            // allow loading sibling copies only once via set
-        }
-        [out addObject:@{ @"path": full, @"pri": @(PriorityForName(item)) }];
+        if (![item.pathExtension.lowercaseString isEqualToString:@"dylib"]) continue;
+        // Never load ourselves again
+        if ([item.lowercaseString containsString:@"dylibloader"]) continue;
+        [out addObject:@{ @"path": full, @"pri": @(Priority(item)) }];
     }
 }
 
-#pragma mark - Load
-
 static BOOL LoadOne(NSString *path) {
-    if (!path.length) return NO;
-
     os_unfair_lock_lock(&gLock);
     if ([LoadedSet() containsObject:path]) {
         os_unfair_lock_unlock(&gLock);
@@ -225,126 +174,91 @@ static BOOL LoadOne(NSString *path) {
     [LoadedSet() addObject:path];
     os_unfair_lock_unlock(&gLock);
 
-    const char *cpath = path.fileSystemRepresentation;
     dlerror();
-    CFTimeInterval t0 = CFAbsoluteTimeGetCurrent();
-    void *h = dlopen(cpath, RTLD_NOW | RTLD_GLOBAL);
-    CFTimeInterval ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+    void *h = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
     if (!h) {
-        const char *err = dlerror();
-        DLLog(@"FAIL %.1fms %s — %s", ms, cpath, err ? err : "?");
+        DLLog(@"dlopen fail %@: %s", path, dlerror());
         os_unfair_lock_lock(&gLock);
         [LoadedSet() removeObject:path];
         os_unfair_lock_unlock(&gLock);
         return NO;
     }
-    DLLog(@"OK   %.1fms %s", ms, cpath);
-    InvokeInits(h, cpath);
-
-    os_unfair_lock_lock(&gLock);
-    [LoadedOrder() addObject:path];
-    os_unfair_lock_unlock(&gLock);
+    DLLog(@"loaded %@", path.lastPathComponent);
+    InvokeInits(h, path.fileSystemRepresentation);
     return YES;
 }
 
-static void LoadAllCollected(void) {
-    NSArray *roots = DiscoverTweakRoots();
-    if (roots.count == 0) {
-        DLLog(@"No Tweaks folders found yet");
+static void LoadPass(void) {
+    // Only one full load pass
+    os_unfair_lock_lock(&gLock);
+    if (gLoadPassDone) {
+        os_unfair_lock_unlock(&gLock);
         return;
     }
+    gLoadPassDone = YES;
+    os_unfair_lock_unlock(&gLock);
 
-    NSMutableArray<NSDictionary *> *all = [NSMutableArray array];
-    for (NSString *root in roots) {
-        DLLog(@"Scan %@", root);
-        CollectDylibs(root, all, 0);
+    NSArray *roots = TweakRoots();
+    NSMutableArray *all = [NSMutableArray array];
+    for (NSString *r in roots) {
+        DLLog(@"scan %@", r);
+        Collect(r, all, 0);
     }
-
     [all sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-        NSInteger pa = [a[@"pri"] integerValue];
-        NSInteger pb = [b[@"pri"] integerValue];
-        if (pa < pb) return NSOrderedAscending;
-        if (pa > pb) return NSOrderedDescending;
+        int pa = [a[@"pri"] intValue], pb = [b[@"pri"] intValue];
+        if (pa != pb) return pa < pb ? NSOrderedAscending : NSOrderedDescending;
         return [a[@"path"] caseInsensitiveCompare:b[@"path"]];
     }];
 
-    CFTimeInterval t0 = CFAbsoluteTimeGetCurrent();
     NSUInteger ok = 0;
-    for (NSDictionary *item in all) {
-        if (LoadOne(item[@"path"])) ok++;
+    for (NSDictionary *it in all) {
+        if (LoadOne(it[@"path"])) ok++;
     }
-    DLLog(@"Loaded %lu/%lu in %.1fms", (unsigned long)ok, (unsigned long)all.count,
-          (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+    DLLog(@"load pass done %lu/%lu", (unsigned long)ok, (unsigned long)all.count);
 }
 
-#pragma mark - Notifications & schedule
+#pragma mark - Bootstrap
 
-static void ArmObservers(void) {
-    if (gObservers) return;
-    gObservers = YES;
-    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-    void (^block)(NSNotification *) = ^(NSNotification *n) {
-        DLLog(@"%@ → kick", n.name);
-        KickAllInits();
-        // Light rescan if nothing loaded yet
-        os_unfair_lock_lock(&gLock);
-        NSUInteger nLoaded = LoadedSet().count;
-        os_unfair_lock_unlock(&gLock);
-        if (nLoaded == 0) {
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                LoadAllCollected();
-                dispatch_async(dispatch_get_main_queue(), ^{ KickAllInits(); });
-            });
-        }
+static void ArmObserversOnce(void) {
+    static BOOL armed = NO;
+    if (armed) return;
+    armed = YES;
+
+    void (^kick)(NSNotification *) = ^(NSNotification *n) {
+        // Only kick if under budget — no rescan
+        KickAllInitsCapped();
     };
-    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:block];
-    [nc addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:block];
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:kick];
     if (@available(iOS 13.0, *)) {
-        [nc addObserverForName:UISceneDidActivateNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:block];
-        [nc addObserverForName:UISceneWillEnterForegroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:block];
+        [nc addObserverForName:UISceneDidActivateNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:kick];
     }
 }
 
-static void ScheduleBurst(void) {
-    // Fast early burst — critical for LC guest UI
-    double delays[] = { 0.15, 0.4, 0.8, 1.2, 1.8, 2.5, 3.5, 5.0, 7.5, 10.0, 15.0, 22.0, 30.0, 45.0 };
-    size_t n = sizeof(delays) / sizeof(delays[0]);
-    for (size_t i = 0; i < n; i++) {
+static void ScheduleLimitedKicks(void) {
+    // Short, capped — does NOT rescan folders
+    double delays[] = { 0.5, 1.5, 3.0, 6.0, 12.0 };
+    for (size_t i = 0; i < sizeof(delays)/sizeof(delays[0]); i++) {
         double d = delays[i];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            KickAllInits();
-            if (d <= 3.5 || d == 10.0 || d == 30.0) {
-                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                    LoadAllCollected();
-                    dispatch_async(dispatch_get_main_queue(), ^{ KickAllInits(); });
-                });
-            }
+            KickAllInitsCapped();
         });
     }
 }
 
-#pragma mark - Entry
-
 static void Bootstrap(void) {
-    if (gBootstrapped) return;
-    gBootstrapped = YES;
-    DLLog(@"Bootstrap (fast LC loader)");
+    if (gStarted) return;
+    gStarted = YES;
+    DLLog(@"v1.1.0 bootstrap");
 
-    // Disk scan off main when possible; constructor may be early
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        LoadAllCollected();
+        LoadPass();
         dispatch_async(dispatch_get_main_queue(), ^{
-            KickAllInits();
-            ArmObservers();
-            ScheduleBurst();
+            KickAllInitsCapped();
+            ArmObserversOnce();
+            ScheduleLimitedKicks();
         });
-    });
-
-    // Also immediate main-queue kick in case something already loaded
-    dispatch_async(dispatch_get_main_queue(), ^{
-        KickAllInits();
-        ArmObservers();
     });
 }
 
@@ -354,15 +268,16 @@ static void DylibLoaderConstructor(void) {
 }
 
 void DylibLoaderDidLoad(void) {
-    DLLog(@"DylibLoaderDidLoad()");
-    gBootstrapped = NO; // allow forced rescan
-    Bootstrap();
+    // Manual: allow one more kick only, not full reload storm
+    KickAllInitsCapped();
 }
 
 void DylibLoaderRescan(void) {
-    DLLog(@"Rescan requested");
+    os_unfair_lock_lock(&gLock);
+    gLoadPassDone = NO;
+    os_unfair_lock_unlock(&gLock);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        LoadAllCollected();
-        dispatch_async(dispatch_get_main_queue(), ^{ KickAllInits(); });
+        LoadPass();
+        dispatch_async(dispatch_get_main_queue(), ^{ KickAllInitsCapped(); });
     });
 }
