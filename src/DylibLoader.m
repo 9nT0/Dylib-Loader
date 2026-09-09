@@ -1,5 +1,5 @@
 /*
- * DylibLoader v1.1.0 — LiveContainer loader (crash-safe)
+ * DylibLoader v1.2.0 — LiveContainer loader (crash-safe, LC-tuned)
  *
  * v1.0 froze/crashed because:
  *  - KickAllInits + LoadAllCollected ran in a tight delayed loop
@@ -10,6 +10,13 @@
  *  - Init symbols called at most a few times (budget)
  *  - No periodic full rescans after first success
  *  - Short, capped re-kick schedule
+ *
+ * v1.2.0 (GlossyGlass / LC reliability):
+ *  - Higher kick budget + longer delayed kicks (guest UI is late)
+ *  - Extra dedicated kicks after loading GlossyGlass
+ *  - Broader LiveContainer / container path roots
+ *  - Optional env DYLIBLOADER_MAX_KICKS
+ *  - Still never depends on GlossyGlass being present
  */
 
 #import <Foundation/Foundation.h>
@@ -17,6 +24,7 @@
 #import <dlfcn.h>
 #import <os/lock.h>
 #import <string.h>
+#import <stdlib.h>
 
 static NSString * const kTag = @"[DylibLoader]";
 static void DLLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -31,12 +39,22 @@ static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableSet<NSString *> *gLoaded;
 static BOOL gStarted = NO;
 static int gKickCount = 0;
-static const int kMaxKicks = 6;           // hard cap
+static int gMaxKicks = 12;            // higher for LC guest UI
 static BOOL gLoadPassDone = NO;
+static BOOL gSawGlossyGlass = NO;
 
 static NSMutableSet<NSString *> *LoadedSet(void) {
     if (!gLoaded) gLoaded = [NSMutableSet new];
     return gLoaded;
+}
+
+static int MaxKicks(void) {
+    const char *env = getenv("DYLIBLOADER_MAX_KICKS");
+    if (env && *env) {
+        int v = atoi(env);
+        if (v >= 4 && v <= 40) return v;
+    }
+    return gMaxKicks;
 }
 
 #pragma mark - Init symbols (capped)
@@ -63,7 +81,8 @@ static void InvokeInits(void *handle, const char *path) {
 
 static void KickAllInitsCapped(void) {
     os_unfair_lock_lock(&gLock);
-    if (gKickCount >= kMaxKicks) {
+    int cap = MaxKicks();
+    if (gKickCount >= cap) {
         os_unfair_lock_unlock(&gLock);
         return;
     }
@@ -71,7 +90,7 @@ static void KickAllInitsCapped(void) {
     int n = gKickCount;
     os_unfair_lock_unlock(&gLock);
 
-    DLLog(@"kick %d/%d", n, kMaxKicks);
+    DLLog(@"kick %d/%d", n, cap);
     for (const char **s = kInits; *s; s++) {
         void *sym = dlsym(RTLD_DEFAULT, *s);
         if (!sym) continue;
@@ -98,11 +117,12 @@ static NSArray<NSString *> *TweakRoots(void) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     if (docs) {
         AddUnique(roots, [docs stringByAppendingPathComponent:@"Tweaks"]);
+        AddUnique(roots, [docs stringByAppendingPathComponent:@"LiveContainer/Tweaks"]);
         NSString *apps = [docs stringByAppendingPathComponent:@"Applications"];
         for (NSString *name in [fm contentsOfDirectoryAtPath:apps error:nil] ?: @[]) {
-            NSString *cand = [[apps stringByAppendingPathComponent:name] stringByAppendingPathComponent:@"Tweaks"];
-            BOOL isDir = NO;
-            if ([fm fileExistsAtPath:cand isDirectory:&isDir] && isDir) AddUnique(roots, cand);
+            NSString *base = [apps stringByAppendingPathComponent:name];
+            AddUnique(roots, [base stringByAppendingPathComponent:@"Tweaks"]);
+            AddUnique(roots, [base stringByAppendingPathComponent:@"Frameworks"]);
         }
     }
 
@@ -110,13 +130,29 @@ static NSArray<NSString *> *TweakRoots(void) {
     if (lib) {
         AddUnique(roots, [lib stringByAppendingPathComponent:@"Tweaks"]);
         AddUnique(roots, [lib stringByAppendingPathComponent:@"LiveContainer/Tweaks"]);
+        AddUnique(roots, [lib stringByAppendingPathComponent:@"Application Support/LiveContainer/Tweaks"]);
     }
 
     NSString *bundle = NSBundle.mainBundle.bundlePath;
     if (bundle.length) {
         AddUnique(roots, [bundle stringByAppendingPathComponent:@"Tweaks"]);
+        AddUnique(roots, [bundle stringByAppendingPathComponent:@"Frameworks"]);
         AddUnique(roots, [[bundle stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"Tweaks"]);
+        // LC often nests guest under Containers / Applications
+        NSString *parent = bundle;
+        for (int i = 0; i < 4; i++) {
+            parent = [parent stringByDeletingLastPathComponent];
+            if (!parent.length || [parent isEqualToString:@"/"]) break;
+            AddUnique(roots, [parent stringByAppendingPathComponent:@"Tweaks"]);
+        }
     }
+
+    // Common LC absolute-ish patterns (best-effort)
+    NSArray *extra = @[
+        @"/var/mobile/Documents/Tweaks",
+        @"/var/mobile/Library/LiveContainer/Tweaks"
+    ];
+    for (NSString *p in extra) AddUnique(roots, p);
 
     NSMutableArray *exist = [NSMutableArray array];
     for (NSString *r in roots) {
@@ -131,9 +167,10 @@ static NSArray<NSString *> *TweakRoots(void) {
 static int Priority(NSString *name) {
     NSString *l = name.lowercaseString;
     if ([l containsString:@"cydiasubstrate"] || [l containsString:@"ellekit"] ||
-        [l containsString:@"libsubstrate"]) return 0;
+        [l containsString:@"libsubstrate"] || [l containsString:@"libhooker"]) return 0;
     if ([l hasPrefix:@"0_"] || [l hasPrefix:@"00"] || [l containsString:@"dylibloader"]) return 1;
-    if ([l containsString:@"glossyglass"]) return 2;
+    if ([l containsString:@"glossyglass"] || [l containsString:@"injector"] ||
+        [l hasPrefix:@"1_"] || [l containsString:@"hook"]) return 2;
     return 3;
 }
 
@@ -183,13 +220,19 @@ static BOOL LoadOne(NSString *path) {
         os_unfair_lock_unlock(&gLock);
         return NO;
     }
+    NSString *base = path.lastPathComponent.lowercaseString;
+    if ([base containsString:@"glossyglass"]) {
+        os_unfair_lock_lock(&gLock);
+        gSawGlossyGlass = YES;
+        os_unfair_lock_unlock(&gLock);
+    }
     DLLog(@"loaded %@", path.lastPathComponent);
     InvokeInits(h, path.fileSystemRepresentation);
     return YES;
 }
 
 static void LoadPass(void) {
-    // Only one full load pass
+    // Only one full load pass (unless Rescan)
     os_unfair_lock_lock(&gLock);
     if (gLoadPassDone) {
         os_unfair_lock_unlock(&gLock);
@@ -214,7 +257,8 @@ static void LoadPass(void) {
     for (NSDictionary *it in all) {
         if (LoadOne(it[@"path"])) ok++;
     }
-    DLLog(@"load pass done %lu/%lu", (unsigned long)ok, (unsigned long)all.count);
+    DLLog(@"load pass done %lu/%lu glossy=%d",
+          (unsigned long)ok, (unsigned long)all.count, gSawGlossyGlass ? 1 : 0);
 }
 
 #pragma mark - Bootstrap
@@ -230,14 +274,17 @@ static void ArmObserversOnce(void) {
     };
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
     [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:kick];
+    [nc addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:kick];
     if (@available(iOS 13.0, *)) {
         [nc addObserverForName:UISceneDidActivateNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:kick];
+        [nc addObserverForName:UISceneWillEnterForegroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:kick];
     }
 }
 
 static void ScheduleLimitedKicks(void) {
-    // Short, capped — does NOT rescan folders
-    double delays[] = { 0.5, 1.5, 3.0, 6.0, 12.0 };
+    // Longer schedule for LiveContainer guest apps (UI appears late)
+    // Does NOT rescan folders
+    double delays[] = { 0.3, 0.8, 1.5, 2.5, 4.0, 6.0, 10.0, 15.0, 22.0, 30.0, 45.0 };
     for (size_t i = 0; i < sizeof(delays)/sizeof(delays[0]); i++) {
         double d = delays[i];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
@@ -250,7 +297,7 @@ static void ScheduleLimitedKicks(void) {
 static void Bootstrap(void) {
     if (gStarted) return;
     gStarted = YES;
-    DLLog(@"v1.1.0 bootstrap");
+    DLLog(@"v1.2.0 bootstrap");
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         LoadPass();
