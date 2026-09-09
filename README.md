@@ -10,7 +10,7 @@
 | Order | Directory order | Priority: Substrate → early → normal → late |
 | Double load | Possible | Path set dedupes |
 | Init symbols | Rely on constructors only | Explicit `GlassLoaderEntry` / `glossyglass_init` / … |
-| Late UI | Often misses | Fast re-kick burst 0.15s–45s + scene observers |
+| Late UI | Often misses | Long re-kick burst 0.3s–45s + scene observers |
 | Disk I/O | Often on load path | Background queue, kicks on main |
 | Frameworks | Limited | Loads `.framework` binaries |
 
@@ -20,17 +20,18 @@
 2. Put in the **app-specific Tweaks** folder as `0_DylibLoader.dylib` (loads first)
 3. Add `GlossyGlass.dylib` (and any other tweaks) in the same folder
 4. Enable TweakLoader for the guest **or** replace LC’s TweakLoader symlink with this build
-5. Open guest app — wait a few seconds on first launch
+5. Open guest app — wait a few seconds on first launch (up to ~15–30s for IG guest UI)
 
-Env override:
+Env overrides:
 
 ```text
 DYLIBLOADER_TWEAKS=/full/path/to/Tweaks
+DYLIBLOADER_MAX_KICKS=16
 ```
 
 ## Priority rules (filename)
 
-1. **Substrate / Ellekit**
+1. **Substrate / Ellekit / libhooker**
 2. Names starting with `0_` / `00` / containing `dylibloader`
 3. `glossyglass`, `injector`, `hook`, `1_`
 4. Everything else
@@ -56,3 +57,5 @@ Or use the included GitHub Action.
 ## Pair with GlossyGlass v3.6.1+
 
 GlossyGlass exports the symbols this loader re-kicks. Together they handle LC’s “constructor before UI” problem.
+
+**Outside LiveContainer:** do **not** inject DylibLoader. GlossyGlass loads via its own constructors / `+load` and does not depend on this loader.
